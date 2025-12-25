@@ -2,6 +2,16 @@
 
 Minimal reproduction for [expanso-io/expanso#395](https://github.com/expanso-io/expanso/issues/395).
 
+## Repository Contents
+
+| Path | Description |
+|------|-------------|
+| `bin/` | Pre-built instrumented binaries (LFS-managed) with debug logging |
+| `patches/fix-395-retry-strategy.patch` | **Proposed fix** - one-line change |
+| `docker/` | Dockerfiles for orchestrator and edge |
+| `pipelines/` | Test job definitions |
+| `docker-compose.debug.yml` | Local debug stack configuration |
+
 ## The Bug
 
 Jobs deployed **while nodes are disconnected** get stuck permanently in `deploying` state.
@@ -10,11 +20,46 @@ The dispatcher sends execution requests to nodes that aren't connected, the mess
 
 ## Root Cause
 
-Dispatcher uses `RetryStrategySkip` - execution assignments are lost when nodes aren't connected. When nodes reconnect:
+**File:** `orchestrator/internal/transport/dispatcher.go:54`
+
+```go
+watcher.WithRetryStrategy(watcher.RetryStrategySkip),  // ← THE BUG
+```
+
+The dispatcher uses `RetryStrategySkip` - execution assignments are lost when nodes aren't connected. When nodes reconnect:
 1. Reevaluator creates new evaluations (trigger=node-join)
 2. Scheduler sees executions already exist (desired=running, state=pending)
 3. No re-dispatch occurs - the execution messages were already "sent"
 4. Job stuck forever in `deploying` with executions in `pending`
+
+## Proposed Fix
+
+See [`patches/fix-395-retry-strategy.patch`](patches/fix-395-retry-strategy.patch):
+
+```diff
+-    watcher.WithRetryStrategy(watcher.RetryStrategySkip),
++    watcher.WithRetryStrategy(watcher.RetryStrategyBlock),
+```
+
+Change from `RetryStrategySkip` to `RetryStrategyBlock` so dispatch failures are retried until the node reconnects.
+
+## Instrumented Binaries
+
+The binaries in `bin/` include additional debug logging that references the source code locations:
+
+**When publishing to a disconnected node** (`manager.go`):
+```
+PUBLISH: Node not connected - message will be LOST
+  root_cause=orchestrator/internal/transport/dispatcher.go:54 uses RetryStrategySkip
+  issue=github.com/expanso-io/expanso/issues/395
+```
+
+**When detecting stuck executions** (`reconciler.go`):
+```
+RECONCILER: STUCK EXECUTIONS DETECTED - dispatch may have failed
+  root_cause=orchestrator/internal/transport/dispatcher.go:54 uses RetryStrategySkip
+  dispatch_code=orchestrator/internal/transport/dispatcher.go:103 PublishAsync call
+```
 
 ---
 
