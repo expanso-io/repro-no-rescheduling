@@ -1,0 +1,17 @@
+input:
+  generate:
+    count: 0
+    interval: 30s
+    mapping: |
+      root.message = "heartbeat"
+      root.timestamp = now()
+      root.hostname = env("HOSTNAME")
+
+pipeline:
+  processors:
+    - mapping: |
+        root = this
+
+output:
+  stdout:
+    codec: lines

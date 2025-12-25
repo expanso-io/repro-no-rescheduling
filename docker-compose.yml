@@ -1,0 +1,24 @@
+services:
+  edge1:
+    image: ghcr.io/expanso-io/expanso-edge:nightly
+    container_name: edge1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        expanso-edge bootstrap --token ${EXPANSO_EDGE_BOOTSTRAP_TOKEN} && \
+        expanso-edge run
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  edge2:
+    image: ghcr.io/expanso-io/expanso-edge:nightly
+    container_name: edge2
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        expanso-edge bootstrap --token ${EXPANSO_EDGE_BOOTSTRAP_TOKEN} && \
+        expanso-edge run
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
