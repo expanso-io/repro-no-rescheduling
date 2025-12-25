@@ -10,9 +10,10 @@ services:
     ports:
       - "4222:4222"
       - "8222:8222"
-    command: ["--jetstream", "--store_dir=/data"]
+    command: ["--config", "/etc/nats/nats.conf"]
     volumes:
       - nats-debug-data:/data
+      - ./config/nats/nats.conf:/etc/nats/nats.conf:ro
     networks:
       - expanso-debug
 
@@ -21,45 +22,42 @@ services:
     container_name: orchestrator-debug
     ports:
       - "9010:9010"
-    environment:
-      - EXPANSO_LOG_LEVEL=debug
+    command: ["run", "--log-level=debug"]
     volumes:
-      - orchestrator-debug-data:/var/lib/expanso
+      - orchestrator-debug-data:/var/lib/expanso/orchestrator
+      - ./config/orchestrator/orchestrator.yaml:/etc/expanso/orchestrator/config.yaml:ro
     depends_on:
       - nats
     networks:
       - expanso-debug
-    command: ["serve", "--orchestrator", "--nats-url=nats://nats:4222"]
 
   edge1:
     image: expanso-edge:debug
     container_name: edge1-debug
-    environment:
-      - EXPANSO_LOG_LEVEL=debug
+    command: ["run", "--log-level=debug"]
     volumes:
-      - edge1-debug-data:/var/lib/expanso
+      - edge1-debug-data:/var/lib/expanso/edge
+      - ./config/edge/edge.yaml:/etc/expanso/edge/config.yaml:ro
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - orchestrator
     networks:
       - expanso-debug
     privileged: true
-    command: ["serve", "--compute", "--orchestrators=nats://nats:4222"]
 
   edge2:
     image: expanso-edge:debug
     container_name: edge2-debug
-    environment:
-      - EXPANSO_LOG_LEVEL=debug
+    command: ["run", "--log-level=debug"]
     volumes:
-      - edge2-debug-data:/var/lib/expanso
+      - edge2-debug-data:/var/lib/expanso/edge
+      - ./config/edge/edge.yaml:/etc/expanso/edge/config.yaml:ro
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - orchestrator
     networks:
       - expanso-debug
     privileged: true
-    command: ["serve", "--compute", "--orchestrators=nats://nats:4222"]
 
 networks:
   expanso-debug:

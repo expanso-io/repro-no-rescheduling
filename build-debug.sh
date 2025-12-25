@@ -1,16 +1,26 @@
 #!/bin/bash
 set -e
 
-echo "Building debug images from local binaries in ./bin..."
+echo "Building Docker images from instrumented binaries in ./bin..."
 
-# Build orchestrator
-echo "Building expanso-orchestrator:debug..."
+# Verify binaries exist
+for bin in bin/expanso-orchestrator bin/expanso-edge bin/expanso-cli; do
+    if [ ! -f "$bin" ]; then
+        echo "Error: $bin not found"
+        exit 1
+    fi
+done
+
+echo "Verifying binaries are Linux..."
+file bin/expanso-* | grep -q "ELF 64-bit" || {
+    echo "Error: binaries must be Linux ELF format, not macOS"
+    exit 1
+}
+
+echo "Building Docker images..."
 docker build -t expanso-orchestrator:debug -f docker/orchestrator.Dockerfile .
-
-# Build edge
-echo "Building expanso-edge:debug..."
 docker build -t expanso-edge:debug -f docker/edge.Dockerfile .
 
 echo ""
-echo "Debug images built successfully!"
+echo "Done!"
 docker images | grep expanso | grep debug

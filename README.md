@@ -47,36 +47,49 @@ docker compose down -v
 
 Use locally-built debug images with added logging to trace the issue.
 
-### Build Debug Images
+### Build & Run
 
 ```bash
-# Option 1: Build from expanso repo
-EXPANSO_REPO=../expanso ./build-debug.sh
+# Build Docker images from instrumented binaries
+./build-debug.sh
 
-# Option 2: Use pre-built binaries in ./bin
-# (if you have local binaries, create images from them)
+# Start local stack (watch logs in terminal)
+docker compose -f docker-compose.debug.yml up
 ```
 
-### Run Local Debug Stack
+### Interact with local cluster
 
 ```bash
-# Start local orchestrator + NATS + edges (no -d, watch logs)
-docker compose -f docker-compose.debug.yml up
+# From your local machine (orchestrator exposes port 9010)
+export EXPANSO_CLI_ENDPOINT=http://localhost:9010
 
-# In another terminal, reproduce:
-# 1. Check nodes connected
-docker exec -it orchestrator-debug expanso-cli node list
+# List nodes
+expanso-cli node list
 
-# 2. Create a job
-docker exec -it orchestrator-debug expanso-cli job run /path/to/job.yaml
+# Run a job
+expanso-cli job run pipelines/test-pipeline.yaml
+
+# List jobs
+expanso-cli job list
+```
+
+### Reproduce the bug locally
+
+```bash
+# 1. Verify nodes connected
+expanso-cli node list
+
+# 2. Create a pipeline job
+expanso-cli job run pipelines/test-pipeline.yaml
 
 # 3. Kill edges
 docker rm -f edge1-debug edge2-debug
 
 # 4. Restart edges
-docker compose -f docker-compose.debug.yml up edge1 edge2
+docker compose -f docker-compose.debug.yml up -d edge1 edge2
 
-# 5. Watch logs for failure pattern
+# 5. Watch logs - job should be stuck
+docker compose -f docker-compose.debug.yml logs -f
 ```
 
 ### Log Patterns to Watch
@@ -100,45 +113,4 @@ RECONCILER: unscheduled_count > 0
 
 ```bash
 docker compose -f docker-compose.debug.yml down -v
-```
-
----
-
-## Reproduce (Fast Timing - 1s Heartbeat)
-
-Tests if the 15s reevaluation batch delay is the culprit.
-
-```bash
-# Use aggressive timing config
-docker compose -f docker-compose.debug-fast.yml up
-```
-
-**Key timing differences:**
-| Setting | Default | Fast |
-|---------|---------|------|
-| Heartbeat frequency | 15s | 1s |
-| Reevaluation batch interval | 15s | 1s |
-| Housekeeping interval | 30s | 1s |
-
-### Timing Pattern to Watch
-
-```
-HANDSHAKE: Node handshake completed      ← Node "connected" in state
-REEVALUATOR: queuing for batch           ← Event queued, batch timer starts
-DISPATCH: Attempting to send             ← ⚠️ Fires IMMEDIATELY
-PUBLISH: Node not connected              ← Transport doesn't have connection yet!
-DISPATCH: Failed - EVENT WILL BE SKIPPED ← Lost forever
-
-... 15 seconds later (or 1s with fast config) ...
-
-REEVALUATOR: Processing batch - START    ← Finally processing
-REEVALUATOR: Created evaluation for job  ← NOW rollout gets re-evaluated
-```
-
-**Hypothesis:** Dispatcher fires on state change before transport connection is ready. The 15s batch delay means re-evaluation happens too late to recover.
-
-### Fast Config Cleanup
-
-```bash
-docker compose -f docker-compose.debug-fast.yml down -v
 ```
