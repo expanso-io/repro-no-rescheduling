@@ -101,3 +101,44 @@ RECONCILER: unscheduled_count > 0
 ```bash
 docker compose -f docker-compose.debug.yml down -v
 ```
+
+---
+
+## Reproduce (Fast Timing - 1s Heartbeat)
+
+Tests if the 15s reevaluation batch delay is the culprit.
+
+```bash
+# Use aggressive timing config
+docker compose -f docker-compose.debug-fast.yml up
+```
+
+**Key timing differences:**
+| Setting | Default | Fast |
+|---------|---------|------|
+| Heartbeat frequency | 15s | 1s |
+| Reevaluation batch interval | 15s | 1s |
+| Housekeeping interval | 30s | 1s |
+
+### Timing Pattern to Watch
+
+```
+HANDSHAKE: Node handshake completed      ← Node "connected" in state
+REEVALUATOR: queuing for batch           ← Event queued, batch timer starts
+DISPATCH: Attempting to send             ← ⚠️ Fires IMMEDIATELY
+PUBLISH: Node not connected              ← Transport doesn't have connection yet!
+DISPATCH: Failed - EVENT WILL BE SKIPPED ← Lost forever
+
+... 15 seconds later (or 1s with fast config) ...
+
+REEVALUATOR: Processing batch - START    ← Finally processing
+REEVALUATOR: Created evaluation for job  ← NOW rollout gets re-evaluated
+```
+
+**Hypothesis:** Dispatcher fires on state change before transport connection is ready. The 15s batch delay means re-evaluation happens too late to recover.
+
+### Fast Config Cleanup
+
+```bash
+docker compose -f docker-compose.debug-fast.yml down -v
+```
