@@ -1,0 +1,72 @@
+# Debug configuration using locally-built instrumented images
+# Usage:
+#   ./build-debug.sh                              # Build debug images first
+#   docker compose -f docker-compose.debug.yml up # Run (no -d, watch logs)
+
+services:
+  nats:
+    image: nats:2.10
+    container_name: nats-debug
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["--jetstream", "--store_dir=/data"]
+    volumes:
+      - nats-debug-data:/data
+    networks:
+      - expanso-debug
+
+  orchestrator:
+    image: expanso-orchestrator:debug
+    container_name: orchestrator-debug
+    ports:
+      - "9010:9010"
+    environment:
+      - EXPANSO_LOG_LEVEL=debug
+    volumes:
+      - orchestrator-debug-data:/var/lib/expanso
+    depends_on:
+      - nats
+    networks:
+      - expanso-debug
+    command: ["serve", "--orchestrator", "--nats-url=nats://nats:4222"]
+
+  edge1:
+    image: expanso-edge:debug
+    container_name: edge1-debug
+    environment:
+      - EXPANSO_LOG_LEVEL=debug
+    volumes:
+      - edge1-debug-data:/var/lib/expanso
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - orchestrator
+    networks:
+      - expanso-debug
+    privileged: true
+    command: ["serve", "--compute", "--orchestrators=nats://nats:4222"]
+
+  edge2:
+    image: expanso-edge:debug
+    container_name: edge2-debug
+    environment:
+      - EXPANSO_LOG_LEVEL=debug
+    volumes:
+      - edge2-debug-data:/var/lib/expanso
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - orchestrator
+    networks:
+      - expanso-debug
+    privileged: true
+    command: ["serve", "--compute", "--orchestrators=nats://nats:4222"]
+
+networks:
+  expanso-debug:
+    driver: bridge
+
+volumes:
+  nats-debug-data:
+  orchestrator-debug-data:
+  edge1-debug-data:
+  edge2-debug-data:
