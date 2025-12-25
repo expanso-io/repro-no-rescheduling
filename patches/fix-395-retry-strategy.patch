@@ -1,0 +1,44 @@
+From: Fix for expanso-io/expanso#395
+Subject: [PATCH] Fix #395: Use RetryStrategyBlock for dispatcher
+
+Problem:
+--------
+Jobs deployed while edge nodes are disconnected get stuck permanently
+in 'deploying' state with executions in 'pending' state.
+
+Root cause:
+-----------
+orchestrator/internal/transport/dispatcher.go:54 uses RetryStrategySkip.
+When PublishAsync fails (node disconnected), the event is skipped and
+never retried. The execution dispatch message is lost forever.
+
+Available retry strategies (lib/watcher/options.go:14-16):
+  - RetryStrategyBlock: Retry infinitely until success
+  - RetryStrategySkip: Skip failed events (current - causes bug)
+
+Fix:
+----
+Change from RetryStrategySkip to RetryStrategyBlock so that dispatch
+failures are retried until the node reconnects.
+
+---
+ orchestrator/internal/transport/dispatcher.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/orchestrator/internal/transport/dispatcher.go b/orchestrator/internal/transport/dispatcher.go
+index 1234567..abcdefg 100644
+--- a/orchestrator/internal/transport/dispatcher.go
++++ b/orchestrator/internal/transport/dispatcher.go
+@@ -51,7 +51,7 @@ func (d *Dispatcher) Start(ctx context.Context) error {
+ 	d.watcher, err = d.watcherRegistry.Create(ctx, dispatcherWatcherID,
+ 		watcher.WithAutoStart(),
+ 		watcher.WithHandler(d),
+ 		watcher.WithEphemeral(),
+-		watcher.WithRetryStrategy(watcher.RetryStrategySkip),
++		watcher.WithRetryStrategy(watcher.RetryStrategyBlock),
+ 		watcher.WithInitialEventIterator(watcher.LatestIterator()),
+ 		watcher.WithFilter(watcher.EventFilter{
+ 			ObjectTypes: []string{state.EventObjectTypeExecution, state.EventObjectTypeStream},
+--
+2.39.0
+
