@@ -1,29 +1,78 @@
 From: Fix for expanso-io/expanso#395
-Subject: [PATCH] Fix #395: Use RetryStrategyBlock for dispatcher
+Subject: [PATCH] Fix #395: Ensure pending executions are dispatched when nodes join
 
-Problem:
---------
-Jobs deployed while edge nodes are disconnected get stuck permanently
-in 'deploying' state with executions in 'pending' state.
+================================================================================
+PROBLEM STATEMENT
+================================================================================
 
-Root cause:
------------
-orchestrator/internal/transport/dispatcher.go:54 uses RetryStrategySkip.
-When PublishAsync fails (node disconnected), the event is skipped and
-never retried. The execution dispatch message is lost forever.
+Jobs get stuck in 'deploying' state with executions stuck in 'pending' state.
+This affects TWO scenarios:
+
+SCENARIO 1: Pending executions not dispatched when nodes reconnect
+-----------------------------------------------------------------------------
+1. Job deployed while node is disconnected
+2. Execution created in database (DesiredState=Running, ComputeState=Pending)
+3. Dispatcher tries to send message - node not connected - message LOST
+4. Node reconnects
+5. Reevaluator creates evaluation (trigger=node-join)
+6. Scheduler sees execution already exists -> does nothing
+7. Execution stuck forever in 'pending'
+
+SCENARIO 2: New executions not created when new nodes join ("run on all nodes")
+-----------------------------------------------------------------------------
+1. Job says "run on all matching nodes" (daemon job)
+2. 10 nodes connected -> 10 executions created and running
+3. 5 new nodes join the cluster
+4. Job should now have 15 executions (one per matching node)
+5. Currently: Reevaluator triggers evaluation, scheduler SHOULD create new
+   executions for new nodes (this part works if matchingNodes() is correct)
+
+================================================================================
+ROOT CAUSE ANALYSIS
+================================================================================
+
+File: orchestrator/internal/transport/dispatcher.go:54
+
+```go
+watcher.WithRetryStrategy(watcher.RetryStrategySkip),
+```
+
+The dispatcher uses fire-and-forget semantics with no retry. When PublishAsync
+fails (node disconnected), the event is skipped and never retried.
 
 Available retry strategies (lib/watcher/options.go:14-16):
-  - RetryStrategyBlock: Retry infinitely until success
-  - RetryStrategySkip: Skip failed events (current - causes bug)
+  - RetryStrategyBlock: Blocks and retries infinitely until success
+  - RetryStrategySkip: Skips failed events (current - causes the bug)
 
-Fix:
-----
+================================================================================
+PROPOSED FIX
+================================================================================
+
+There are TWO complementary approaches:
+
+APPROACH A: Change dispatcher retry strategy (simple but potentially blocking)
+-----------------------------------------------------------------------------
 Change from RetryStrategySkip to RetryStrategyBlock so that dispatch
 failures are retried until the node reconnects.
 
----
- orchestrator/internal/transport/dispatcher.go | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+PROS: Simple one-line fix
+CONS: Could block dispatcher if node never returns; affects ALL dispatches
+
+APPROACH B: Re-dispatch pending executions on node-join (recommended)
+-----------------------------------------------------------------------------
+When a node joins, the scheduler should check for pending executions
+targeted at that node and re-dispatch them.
+
+This requires changes in:
+1. orchestrator/internal/scheduler/reconciler.go - detect and re-dispatch
+2. orchestrator/internal/nodes/reevaluator.go - pass node IDs to scheduler
+
+PROS: More robust, self-healing, works even after restarts
+CONS: Requires more code changes
+
+================================================================================
+IMPLEMENTATION: APPROACH A (Minimal Fix)
+================================================================================
 
 diff --git a/orchestrator/internal/transport/dispatcher.go b/orchestrator/internal/transport/dispatcher.go
 index 1234567..abcdefg 100644
@@ -39,6 +88,273 @@ index 1234567..abcdefg 100644
  		watcher.WithInitialEventIterator(watcher.LatestIterator()),
  		watcher.WithFilter(watcher.EventFilter{
  			ObjectTypes: []string{state.EventObjectTypeExecution, state.EventObjectTypeStream},
+
+================================================================================
+IMPLEMENTATION: APPROACH B (Recommended - Re-dispatch on node join)
+================================================================================
+
+This approach adds a "pending execution dispatcher" that runs when nodes join.
+
+diff --git a/orchestrator/internal/scheduler/reconciler.go b/orchestrator/internal/scheduler/reconciler.go
+--- a/orchestrator/internal/scheduler/reconciler.go
++++ b/orchestrator/internal/scheduler/reconciler.go
+@@ -189,6 +189,11 @@ func (e *Reconciler) reconcileDaemon() error {
++	// Priority 1.5: Re-dispatch pending executions
++	// When a node joins (trigger=node-join), check if there are pending
++	// executions that should be dispatched to this node.
++	if err := e.redispatchPendingExecutions(); err != nil {
++		return err
++	}
++
+ 	// Priority 2: Node health failures (only fails on Lost nodes, not Disconnected)
+ 	if err := e.failLostNodeExecutions(); err != nil {
+
++// redispatchPendingExecutions finds pending executions that should be
++// dispatched to connected nodes and marks them for re-dispatch.
++//
++// This handles the case where:
++// 1. Execution was created while node was disconnected
++// 2. Dispatch message was lost (fire-and-forget with no retry)
++// 3. Node reconnects -> this function ensures pending executions are dispatched
++func (e *Reconciler) redispatchPendingExecutions() error {
++	// Only run on node-join triggered evaluations
++	if e.evaluation.TriggeredBy != types.EvalTriggerNodeJoin {
++		return nil
++	}
++
++	// Get all pending executions for this job
++	pendingExecs := e.allExecutions.filter(func(exec *types.Execution) bool {
++		return exec.Status.DesiredState.StateType == types.ExecutionDesiredStateRunning &&
++			exec.Status.ComputeState.StateType == types.ExecutionStatePending
++	})
++
++	if len(pendingExecs) == 0 {
++		return nil
++	}
++
++	// Get connected nodes
++	matchingNodes, _, err := e.matchingNodes()
++	if err != nil {
++		return err
++	}
++
++	connectedNodeIDs := make(map[string]bool)
++	for _, node := range matchingNodes {
++		if node.Node.IsConnected() {
++			connectedNodeIDs[node.Node.ID] = true
++		}
++	}
++
++	// Mark pending executions on connected nodes for re-dispatch
++	for _, exec := range pendingExecs {
++		if connectedNodeIDs[exec.NodeID] {
++			slog.Info("RECONCILER: Re-dispatching pending execution to reconnected node",
++				"execution_id", exec.ID,
++				"job_id", e.job.ID,
++				"node_id", exec.NodeID)
++			e.plan.MarkForRedispatch(exec.ID)
++		}
++	}
++
++	return nil
++}
+
+diff --git a/types/plan.go b/types/plan.go
+--- a/types/plan.go
++++ b/types/plan.go
+@@ -XX,X +XX,X @@ type Plan struct {
++	// ExecutionsToRedispatch contains execution IDs that should be re-dispatched
++	// This happens when a node reconnects and has pending executions
++	ExecutionsToRedispatch []string
++}
+
++// MarkForRedispatch marks an execution for re-dispatch
++func (p *Plan) MarkForRedispatch(execID string) {
++	p.ExecutionsToRedispatch = append(p.ExecutionsToRedispatch, execID)
++}
+
+diff --git a/orchestrator/internal/scheduler/planner.go b/orchestrator/internal/scheduler/planner.go
+--- a/orchestrator/internal/scheduler/planner.go
++++ b/orchestrator/internal/scheduler/planner.go
+@@ -XX,X +XX,X @@ func (p *Planner) Apply(ctx context.Context, plan *types.Plan) error {
++	// Re-dispatch pending executions
++	for _, execID := range plan.ExecutionsToRedispatch {
++		exec, err := p.store.Executions().GetByID(ctx, execID)
++		if err != nil {
++			slog.Error("Failed to get execution for re-dispatch", "exec_id", execID, "error", err)
++			continue
++		}
++		if err := p.dispatcher.Dispatch(ctx, exec); err != nil {
++			slog.Error("Failed to re-dispatch execution", "exec_id", execID, "error", err)
++		}
++	}
+
+================================================================================
+UNIT TESTS
+================================================================================
+
+diff --git a/orchestrator/internal/scheduler/reconciler_test.go b/orchestrator/internal/scheduler/reconciler_test.go
+--- a/orchestrator/internal/scheduler/reconciler_test.go
++++ b/orchestrator/internal/scheduler/reconciler_test.go
+@@ -XXXX,X +XXXX,X @@ func (s *ReconcilerTestSuite) TestPendingExecutionsRedispatchedOnNodeJoin() {
++// TestPendingExecutionsRedispatchedOnNodeJoin verifies that pending executions
++// are re-dispatched when a node reconnects.
++//
++// Scenario:
++// 1. Job deployed while node was disconnected
++// 2. Execution created but dispatch message lost
++// 3. Node reconnects, triggering node-join evaluation
++// 4. Scheduler should mark execution for re-dispatch
++func (s *ReconcilerTestSuite) TestPendingExecutionsRedispatchedOnNodeJoin() {
++	// Setup: Job with execution stuck in pending state
++	job := s.createTestJob("test-job", types.JobTypePipeline)
++
++	// Execution was created but never dispatched (node was disconnected)
++	execution := &types.Execution{
++		ID:      "exec-1",
++		JobID:   job.ID,
++		NodeID:  "node-1",
++		Status: types.ExecutionStatus{
++			DesiredState: types.State[types.ExecutionDesiredStateType]{
++				StateType: types.ExecutionDesiredStateRunning,
++			},
++			ComputeState: types.State[types.ExecutionStateType]{
++				StateType: types.ExecutionStatePending, // Stuck!
++			},
++		},
++	}
++
++	// Node is now connected
++	node := &types.Node{
++		ID: "node-1",
++		Status: types.NodeStatus{
++			Connection: types.NodeConnectionConnected,
++		},
++	}
++
++	// Evaluation triggered by node-join
++	eval := types.NewEvaluation().
++		WithJobID(job.ID).
++		WithTriggeredBy(types.EvalTriggerNodeJoin)
++
++	reconciler := newReconciler(ReconcilerParams{
++		Job:        job,
++		Evaluation: eval,
++		AllExecutions: execSet{execution},
++		PreloadedMatchingNodes: []interfaces.NodeRank{{Node: node}},
++	})
++
++	err := reconciler.Reconcile()
++	s.Require().NoError(err)
++
++	// Verify execution is marked for re-dispatch
++	s.Require().Contains(reconciler.plan.ExecutionsToRedispatch, "exec-1")
++}
+
++// TestNewNodeGetsExecutionForDaemonJob verifies that when a new node joins,
++// a daemon job creates a new execution for it.
++//
++// Scenario:
++// 1. Job running on 10 nodes (10 executions)
++// 2. New node joins the cluster
++// 3. Scheduler should create 11th execution for the new node
++func (s *ReconcilerTestSuite) TestNewNodeGetsExecutionForDaemonJob() {
++	// Setup: Daemon job running on 2 nodes
++	job := s.createTestJob("daemon-job", types.JobTypePipeline)
++
++	existingExecs := execSet{
++		{ID: "exec-1", JobID: job.ID, NodeID: "node-1",
++			Status: types.ExecutionStatus{
++				ComputeState: types.State[types.ExecutionStateType]{StateType: types.ExecutionStateRunning},
++			}},
++		{ID: "exec-2", JobID: job.ID, NodeID: "node-2",
++			Status: types.ExecutionStatus{
++				ComputeState: types.State[types.ExecutionStateType]{StateType: types.ExecutionStateRunning},
++			}},
++	}
++
++	// 3 nodes available (node-3 is new)
++	nodes := []interfaces.NodeRank{
++		{Node: &types.Node{ID: "node-1", Status: types.NodeStatus{Connection: types.NodeConnectionConnected}}},
++		{Node: &types.Node{ID: "node-2", Status: types.NodeStatus{Connection: types.NodeConnectionConnected}}},
++		{Node: &types.Node{ID: "node-3", Status: types.NodeStatus{Connection: types.NodeConnectionConnected}}}, // NEW
++	}
++
++	eval := types.NewEvaluation().
++		WithJobID(job.ID).
++		WithTriggeredBy(types.EvalTriggerNodeJoin)
++
++	reconciler := newReconciler(ReconcilerParams{
++		Job:                    job,
++		Evaluation:             eval,
++		AllExecutions:          existingExecs,
++		PreloadedMatchingNodes: nodes,
++	})
++
++	err := reconciler.Reconcile()
++	s.Require().NoError(err)
++
++	// Verify a new execution is created for node-3
++	newExecs := reconciler.plan.ExecutionsToCreate
++	s.Require().Len(newExecs, 1)
++	s.Require().Equal("node-3", newExecs[0].NodeID)
++}
+
++// TestPendingExecutionsNotRedispatchedIfNodeStillDisconnected verifies that
++// pending executions are NOT re-dispatched if the node is still disconnected.
++func (s *ReconcilerTestSuite) TestPendingExecutionsNotRedispatchedIfNodeStillDisconnected() {
++	job := s.createTestJob("test-job", types.JobTypePipeline)
++
++	// Execution stuck in pending
++	execution := &types.Execution{
++		ID:     "exec-1",
++		JobID:  job.ID,
++		NodeID: "node-1",
++		Status: types.ExecutionStatus{
++			DesiredState:  types.State[types.ExecutionDesiredStateType]{StateType: types.ExecutionDesiredStateRunning},
++			ComputeState: types.State[types.ExecutionStateType]{StateType: types.ExecutionStatePending},
++		},
++	}
++
++	// Node is STILL disconnected
++	node := &types.Node{
++		ID: "node-1",
++		Status: types.NodeStatus{
++			Connection: types.NodeConnectionDisconnected,
++		},
++	}
++
++	eval := types.NewEvaluation().
++		WithJobID(job.ID).
++		WithTriggeredBy(types.EvalTriggerNodeJoin)
++
++	reconciler := newReconciler(ReconcilerParams{
++		Job:                    job,
++		Evaluation:             eval,
++		AllExecutions:          execSet{execution},
++		PreloadedMatchingNodes: []interfaces.NodeRank{{Node: node}},
++	})
++
++	err := reconciler.Reconcile()
++	s.Require().NoError(err)
++
++	// Verify execution is NOT marked for re-dispatch (node still disconnected)
++	s.Require().Empty(reconciler.plan.ExecutionsToRedispatch)
++}
+
+================================================================================
+SUMMARY
+================================================================================
+
+The fix ensures:
+1. Pending executions are re-dispatched when their target node reconnects
+2. New nodes get new executions for daemon ("all nodes") jobs
+3. The system is self-healing - even after restarts, pending executions
+   will be dispatched on the next node-join event
+
+Recommended approach: Implement Approach B (re-dispatch on node join) as it's
+more robust and doesn't risk blocking the dispatcher. Approach A can be used
+as a quick fix but should be combined with timeout/backoff logic.
+
 --
 2.39.0
-

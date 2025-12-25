@@ -7,16 +7,32 @@ Minimal reproduction for [expanso-io/expanso#395](https://github.com/expanso-io/
 | Path | Description |
 |------|-------------|
 | `bin/` | Pre-built instrumented binaries (LFS-managed) with debug logging |
-| `patches/fix-395-retry-strategy.patch` | **Proposed fix** - one-line change |
+| `patches/fix-395-retry-strategy.patch` | **Proposed fix** with two approaches and unit tests |
 | `docker/` | Dockerfiles for orchestrator and edge |
 | `pipelines/` | Test job definitions |
 | `docker-compose.debug.yml` | Local debug stack configuration |
 
 ## The Bug
 
-Jobs deployed **while nodes are disconnected** get stuck permanently in `deploying` state.
+Jobs get stuck in `deploying` state with executions stuck in `pending` state.
 
-The dispatcher sends execution requests to nodes that aren't connected, the messages are lost, and there's no retry mechanism when nodes reconnect.
+### Scenario 1: Pending executions not dispatched when nodes reconnect
+
+1. Job deployed while node is disconnected
+2. Execution created in database (`DesiredState=Running`, `ComputeState=Pending`)
+3. Dispatcher tries to send message → node not connected → **message LOST**
+4. Node reconnects
+5. Reevaluator creates evaluation (`trigger=node-join`)
+6. Scheduler sees execution already exists → does nothing
+7. **Execution stuck forever in 'pending'**
+
+### Scenario 2: New nodes don't get executions for "run on all nodes" jobs
+
+1. Job says "run on all matching nodes" (daemon job)
+2. 10 nodes connected → 10 executions created and running
+3. 5 new nodes join the cluster
+4. Job should now have 15 executions (one per matching node)
+5. **New nodes never get executions** if scheduler doesn't properly handle node-join
 
 ## Root Cause
 
@@ -34,14 +50,199 @@ The dispatcher uses `RetryStrategySkip` - execution assignments are lost when no
 
 ## Proposed Fix
 
-See [`patches/fix-395-retry-strategy.patch`](patches/fix-395-retry-strategy.patch):
+See [`patches/fix-395-retry-strategy.patch`](patches/fix-395-retry-strategy.patch) for full details with unit tests.
+
+### Approach A: Change retry strategy (simple but risky)
 
 ```diff
 -    watcher.WithRetryStrategy(watcher.RetryStrategySkip),
 +    watcher.WithRetryStrategy(watcher.RetryStrategyBlock),
 ```
 
-Change from `RetryStrategySkip` to `RetryStrategyBlock` so dispatch failures are retried until the node reconnects.
+**Pros:** One-line fix
+**Cons:** Could block dispatcher if node never returns
+
+### Approach B: Re-dispatch on node-join (recommended)
+
+When a node joins, the scheduler should:
+1. Find pending executions targeted at that node
+2. Re-dispatch them
+
+```go
+// In reconciler.go - on node-join evaluation:
+func (e *Reconciler) redispatchPendingExecutions() error {
+    pendingExecs := e.allExecutions.filter(isPendingWithDesiredRunning)
+    for _, exec := range pendingExecs {
+        if nodeIsConnected(exec.NodeID) {
+            e.plan.MarkForRedispatch(exec.ID)
+        }
+    }
+}
+```
+
+**Pros:** Self-healing, works after restarts, no blocking
+**Cons:** More code changes required
+
+---
+
+## State Machine & Edge Cases
+
+### Execution State Transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: Execution Created
+
+    Pending --> Running: Dispatch Success<br/>(node connected)
+    Pending --> Pending: Dispatch Failed<br/>(node disconnected, message LOST)
+    Pending --> Cancelled: Job cancelled/updated
+
+    Running --> Completed: Task finished successfully
+    Running --> Failed: Task error
+    Running --> Stopped: Job stopped
+    Running --> Failed: Node lost (timeout)
+
+    Completed --> [*]
+    Failed --> [*]
+    Stopped --> [*]
+    Cancelled --> [*]
+
+    note right of Pending
+        BUG: If dispatch fails,
+        execution stays here forever
+    end note
+```
+
+### Node Connection States
+
+```mermaid
+stateDiagram-v2
+    [*] --> Disconnected: Node registered
+
+    Disconnected --> Connected: Handshake success
+    Connected --> Disconnected: Heartbeat timeout
+    Disconnected --> Lost: Extended timeout
+    Lost --> Connected: Node reconnects
+    Connected --> Connected: Heartbeat received
+
+    Lost --> [*]: Node deregistered
+```
+
+### Edge Cases Matrix
+
+| Scenario | Current Behavior | Expected Behavior | Status |
+|----------|------------------|-------------------|--------|
+| **Node Join - New Node** | | | |
+| Daemon job running, new node joins | Reevaluator triggers eval → Scheduler creates new execution | Same | ✅ Works |
+| **Node Join - Reconnection** | | | |
+| Pending execution exists, node reconnects | Eval triggered → Scheduler sees exec exists → No action | Should re-dispatch pending execution | ❌ **BUG** |
+| Running execution exists, node reconnects | Eval triggered → No change needed | Same | ✅ Works |
+| **Node Leave - Temporary** | | | |
+| Node disconnects briefly | Execution continues (optimistic) | Same | ✅ Works |
+| **Node Leave - Lost** | | | |
+| Node exceeds lost timeout | Execution marked Failed | Same | ✅ Works |
+| **Job Deploy - All Nodes Connected** | | | |
+| Deploy job, all nodes online | Executions created and dispatched | Same | ✅ Works |
+| **Job Deploy - Some Nodes Disconnected** | | | |
+| Deploy job, some nodes offline | Executions created, dispatch fails silently | Should retry on reconnect | ❌ **BUG** |
+| **Job Deploy - No Nodes** | | | |
+| Deploy job, zero nodes | Job queued, waiting | Same | ✅ Works |
+| **Scaling Up** | | | |
+| Add 5 nodes to running daemon job | Reevaluator triggers eval → 5 new executions | Same | ✅ Works (if matchingNodes correct) |
+| **Scaling Down** | | | |
+| Remove 5 nodes from running daemon job | Executions on lost nodes → Failed | Same | ✅ Works |
+
+### Detailed Scenarios
+
+#### Scenario A: Deploy While Node Disconnected
+
+```
+Timeline:
+─────────────────────────────────────────────────────────────────────
+t0: Node-1 connected, Node-2 disconnected
+t1: User deploys daemon job (should run on all nodes)
+t2: Scheduler creates Exec-1 (Node-1) and Exec-2 (Node-2)
+t3: Dispatcher sends to Node-1 → SUCCESS → Exec-1 Running
+t4: Dispatcher sends to Node-2 → FAIL (disconnected) → MESSAGE LOST
+t5: Exec-2 stays Pending forever
+t6: Node-2 reconnects
+t7: Reevaluator creates evaluation (trigger=node-join)
+t8: Scheduler processes eval, sees Exec-2 exists → DOES NOTHING ❌
+t9: Exec-2 still Pending, Job stuck in "deploying"
+
+Expected at t8: Scheduler should re-dispatch Exec-2 to Node-2
+```
+
+#### Scenario B: New Node Joins Running Job
+
+```
+Timeline:
+─────────────────────────────────────────────────────────────────────
+t0: Daemon job running on Node-1, Node-2 (2 executions)
+t1: Node-3 joins cluster
+t2: Reevaluator detects node-join, creates evaluation
+t3: Scheduler processes eval
+t4: matchingNodes() returns [Node-1, Node-2, Node-3]
+t5: Scheduler sees Node-3 has no execution → creates Exec-3 ✅
+t6: Dispatcher sends to Node-3 → SUCCESS
+t7: Job now running on 3 nodes
+
+This scenario works correctly IF matchingNodes() properly includes new node.
+```
+
+#### Scenario C: Node Briefly Disconnects Then Reconnects
+
+```
+Timeline:
+─────────────────────────────────────────────────────────────────────
+t0: Job running on Node-1 (Exec-1 Running)
+t1: Node-1 disconnects (network blip)
+t2: Exec-1 still Running (optimistic, waiting for heartbeat timeout)
+t3: Node-1 reconnects before timeout
+t4: Reevaluator creates evaluation (trigger=node-join)
+t5: Scheduler processes eval, Exec-1 still Running → no action needed ✅
+t6: Everything continues normally
+
+This scenario works correctly.
+```
+
+#### Scenario D: Node Lost (Extended Timeout)
+
+```
+Timeline:
+─────────────────────────────────────────────────────────────────────
+t0: Job running on Node-1 (Exec-1 Running)
+t1: Node-1 disconnects
+t2: Heartbeat timeout → Node-1 marked Disconnected
+t3: Extended timeout → Node-1 marked Lost
+t4: Reevaluator creates evaluation (trigger=node-leave)
+t5: Scheduler processes eval
+t6: failLostNodeExecutions() marks Exec-1 as Failed ✅
+t7: placeExecutions() tries to find new node for replacement
+
+This scenario works correctly.
+```
+
+### The Fix: Re-dispatch Flow
+
+```mermaid
+flowchart TD
+    A[Node Joins] --> B[Reevaluator detects node-join]
+    B --> C[Create evaluation trigger=node-join]
+    C --> D[Scheduler processes evaluation]
+    D --> E{Any pending executions?}
+    E -->|No| F[placeExecutions for new nodes]
+    E -->|Yes| G[redispatchPendingExecutions]
+    G --> H{Node connected?}
+    H -->|Yes| I[Mark for re-dispatch]
+    H -->|No| J[Skip - still disconnected]
+    I --> K[Planner dispatches to node]
+    J --> F
+    K --> F
+    F --> L[Done]
+```
+
+---
 
 ## Instrumented Binaries
 
