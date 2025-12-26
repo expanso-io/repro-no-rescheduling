@@ -48,6 +48,42 @@ The dispatcher uses `RetryStrategySkip` - execution assignments are lost when no
 3. No re-dispatch occurs - the execution messages were already "sent"
 4. Job stuck forever in `deploying` with executions in `pending`
 
+### Why This Happens: The 5-Minute Disconnect Window
+
+The orchestrator has a **5-minute disconnect timeout** ([defaults.go:51-59](https://github.com/expanso-io/expanso/blob/7ba54d408975774e5d91da162bfc303c91c11f08/orchestrator/pkg/config/defaults.go#L51-L59)). During this window:
+
+1. Node actually disconnects (network failure, restart, etc.)
+2. **Orchestrator still believes node is connected** (hasn't hit timeout yet)
+3. User deploys a new job during this window
+4. Execution created, dispatch message sent to NATS
+5. **Message lost** - no subscriber (node is actually offline)
+6. After 5 minutes, orchestrator marks node as disconnected
+7. Node reconnects - but execution stays stuck in `pending`
+
+This is a **known limitation** pending periodic and on-reconnect state reconciliation between edge and orchestrator. The current system is purely event-based without reconciliation on reconnect.
+
+### Cascading Failure: Stuck Executions Block Future Jobs
+
+**Critical:** A stuck pending execution doesn't just affect one job - it **blocks ALL future jobs** to that node.
+
+Why: The scheduler's `nodesToAvoid()` function (reconciler.go:1368) checks for non-terminal executions:
+```go
+// Non-terminal executions always block (job is running/pending)
+if !exec.IsTerminal() {
+    result[exec.NodeID] = true
+    continue
+}
+```
+
+Since `Pending` is non-terminal, **any new job will skip that node** until the stuck execution is manually resolved.
+
+### Bidirectional Message Loss
+
+The same issue affects edge→orchestrator messages:
+- Edge completes/fails a job while temporarily disconnected
+- Status update message sent to NATS but orchestrator doesn't receive it
+- Orchestrator thinks execution is still running when it's actually done
+
 ## Proposed Fix
 
 See [`patches/fix-395-retry-strategy.patch`](patches/fix-395-retry-strategy.patch) for full details with unit tests.
@@ -352,6 +388,112 @@ REEVALUATOR: Created evaluation for job (trigger=node-join)
 
 ```bash
 docker compose -f docker-compose.debug.yml down -v
+```
+
+---
+
+## Extended Scenario: Cascading Node Blocking
+
+This scenario demonstrates that a stuck pending execution **blocks all future jobs** to that node.
+
+### Reproduce the cascading failure
+
+```bash
+# 1. Start with clean environment
+docker compose -f docker-compose.debug.yml up -d
+sleep 10
+
+# 2. Verify nodes are connected
+docker exec orchestrator-debug expanso-cli node list
+# Should show edge1-debug and edge2-debug as connected
+
+# 3. Deploy first job (proves things work)
+docker cp pipelines/test-job.yaml orchestrator-debug:/tmp/
+docker exec orchestrator-debug expanso-cli job deploy /tmp/test-job.yaml
+sleep 5
+docker exec orchestrator-debug expanso-cli execution list
+# Both nodes should have running executions
+
+# 4. Kill edges WITHOUT waiting for orchestrator to detect
+docker rm -f edge1-debug edge2-debug
+
+# 5. IMMEDIATELY deploy second job (within 5-min timeout window)
+docker cp pipelines/new-job.yaml orchestrator-debug:/tmp/
+docker exec orchestrator-debug expanso-cli job deploy /tmp/new-job.yaml
+
+# 6. Check executions - new-test-job has pending executions
+docker exec orchestrator-debug expanso-cli execution list
+# new-test-job executions show state=pending, desired=running
+
+# 7. Restart edges and wait for reconnection
+docker compose -f docker-compose.debug.yml up -d edge1 edge2
+sleep 30
+
+# 8. PROBLEM 1: new-test-job is STILL stuck
+docker exec orchestrator-debug expanso-cli job list
+# new-test-job still shows "deploying"
+docker exec orchestrator-debug expanso-cli execution list
+# new-test-job executions STILL show state=pending
+
+# 9. Deploy THIRD job to demonstrate cascading failure
+cat > /tmp/third-job.yaml << 'EOF'
+name: third-test-job
+type: pipeline
+config:
+  input:
+    generate:
+      count: 0
+      interval: 5s
+      mapping: |
+        root.message = "THIRD JOB"
+  pipeline:
+    processors:
+      - mapping: |
+          root = this
+  output:
+    stdout:
+      codec: lines
+EOF
+docker cp /tmp/third-job.yaml orchestrator-debug:/tmp/
+docker exec orchestrator-debug expanso-cli job deploy /tmp/third-job.yaml
+
+# 10. PROBLEM 2: Third job ALSO gets stuck because nodes are "blocked"
+docker exec orchestrator-debug expanso-cli job list
+# third-test-job shows "deploying" or "queued"
+
+docker exec orchestrator-debug expanso-cli execution list | grep third
+# No executions created for third-test-job on blocked nodes!
+```
+
+### What's happening
+
+```
+Timeline:
+─────────────────────────────────────────────────────────────────────
+t0: edges connected, orchestrator knows they're connected
+t1: edges actually die (docker rm)
+t2: orchestrator still thinks edges are connected (5-min timeout not hit)
+t3: new-test-job deployed, executions created
+t4: dispatch messages sent to NATS → LOST (no subscribers)
+t5: new-test-job stuck: executions pending, desired=running
+t6: edges restart and reconnect
+t7: scheduler sees pending executions exist → does nothing
+t8: third-test-job deployed
+t9: scheduler checks nodesToAvoid() → nodes have pending executions
+t10: scheduler skips both nodes → third-test-job can't run ANYWHERE
+
+CASCADING FAILURE: One stuck job blocks ALL future jobs on those nodes!
+```
+
+### Verify the blocking behavior
+
+```bash
+# Check which nodes are being avoided
+docker logs orchestrator-debug 2>&1 | grep -E "(STUCK|nodesToAvoid|skipping)"
+
+# The scheduler log should show:
+# "RECONCILER: STUCK EXECUTIONS DETECTED"
+# followed by new jobs being placed on zero nodes
 ```
 
 ---
